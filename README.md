@@ -26,7 +26,7 @@ pip install -r requirements.txt
 
 WhatsChat requires Green API credentials to function. You need to:
 
-1. Create an account on [Green API](https://green-api.com/)
+1. Create an account on [Green API](https://green-api.com/en)
 2. Set up your WhatsApp instance
 3. Export your credentials as environment variables:
 

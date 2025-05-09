@@ -1,0 +1,651 @@
+#!/usr/bin/env python3
+import requests
+import json
+import re
+import argparse
+from datetime import datetime
+import os
+import sys
+import time
+import signal
+from openai import OpenAI
+
+is_exiting = False
+
+def call_gpt(message_text):
+    openai_api_key = os.environ.get("OPENAI_API_KEY", "")
+    if not openai_api_key:
+        print(f"{Colors.RED}Error: OpenAI API key not set.{Colors.ENDC}")
+        print(f"{Colors.YELLOW}Please set the OPENAI_API_KEY environment variable.{Colors.ENDC}")
+        print("Example: export OPENAI_API_KEY='your-api-key-here'")
+        return None
+    if not message_text:
+        print(f"{Colors.RED}Error: No message provided to send to GPT.{Colors.ENDC}")
+        return None
+    try:
+        print(f"{Colors.CYAN}Sending request to GPT...{Colors.ENDC}")
+        client = OpenAI(api_key=openai_api_key)
+        response = client.chat.completions.create(
+            model="o4-mini",
+            messages=[
+                {"role": "system", "content": """user gonna give you a message 
+                 and your reply will be used to sent as whatsapp to some person. 
+                 your respond must be concise and short as possible.
+                 do not give options or placeholders just rely on general way of speaking."""},
+                {"role": "user", "content": message_text}
+            ],
+        )
+        result = response.choices[0].message.content
+        return result
+    except Exception as e:
+        print(f"{Colors.RED}Error calling GPT: {str(e)}{Colors.ENDC}")
+        return None
+    
+def signal_handler(sig, frame):
+    global is_exiting
+    is_exiting = True
+    print(f"\n{Colors.YELLOW}Interrupt received, exiting gracefully...{Colors.ENDC}")
+    sys.exit(0)
+signal.signal(signal.SIGINT, signal_handler)
+
+class Colors:
+    HEADER = '\033[95m'
+    BLUE = '\033[94m'
+    CYAN = '\033[96m'
+    GREEN = '\033[92m'
+    YELLOW = '\033[93m'
+    RED = '\033[91m'
+    ENDC = '\033[0m'
+    BOLD = '\033[1m'
+    UNDERLINE = '\033[4m'
+    
+INSTANCE_ID = os.environ.get("GREENAPI_ID_INSTANCE", "")
+API_TOKEN = os.environ.get("GREENAPI_API_TOKEN", "")
+if not INSTANCE_ID or not API_TOKEN:
+    print(f"{Colors.RED}Error: Required environment variables not set.{Colors.ENDC}")
+    print(f"{Colors.YELLOW}Please set GREENAPI_ID_INSTANCE and GREENAPI_API_TOKEN environment variables.{Colors.ENDC}")
+    print(f"Example: export GREENAPI_ID_INSTANCE='YOUR_INSTANCE_ID_HERE'")
+    print(f"         export GREENAPI_API_TOKEN='YOUR_API_TOKEN_HERE'")
+    sys.exit(1)
+BASE_URL = f"https://7105.api.greenapi.com/waInstance{INSTANCE_ID}"
+
+def parse_arguments():
+    parser = argparse.ArgumentParser(description='WhatsApp Message Viewer')
+    mode_group = parser.add_mutually_exclusive_group(required=True)
+    mode_group.add_argument('-c', '--chat', action='store_true',
+                        help='Show chat history (both incoming and outgoing)')
+    mode_group.add_argument('-o', '--outgoing', action='store_true',
+                        help='Show only outgoing messages')
+    mode_group.add_argument('-r', '--receiving', action='store_true',
+                        help='Show only incoming/received messages')
+    mode_group.add_argument('-m', '--monitor', action='store_true',
+                        help='Monitor for new messages in real-time')
+    mode_group.add_argument('-s', '--send', action='store_true',
+                        help='Send a message to a specific contact')
+    mode_group.add_argument('-a', '--ai', action='store_true',
+                        help='Send text to GPT model and automatically send the response to a contact')
+    parser.add_argument('-t', '--time', type=int, default=20,
+                        help='Time in minutes to fetch messages for (default: 20)')
+    parser.add_argument('-i', '--identifier', type=str,
+                        help='Filter or target contact (name or number)')
+    parser.add_argument('-g', '--groups', action='store_true',
+                        help='Include group messages (default: exclude groups)')
+    parser.add_argument('--text', type=str,
+                        help='Message text to send (used with -s/--send or --ai)')
+    return parser.parse_args()
+
+def fetch_contacts():
+    url = f"{BASE_URL}/getContacts/{API_TOKEN}"
+    payload = {}
+    headers = {}
+    try:
+        response = requests.request("GET", url, headers=headers, data=payload, timeout=10)
+        if response.status_code != 200:
+            print(f"{Colors.RED}Error fetching contacts: API returned status code {response.status_code}{Colors.ENDC}")
+            return {}
+        try:
+            contacts_data = json.loads(response.text)
+        except json.JSONDecodeError:
+            print(f"{Colors.RED}Error: Could not parse API response as JSON{Colors.ENDC}")
+            return {}
+        if not isinstance(contacts_data, list):
+            print(f"{Colors.RED}Error: Unexpected API response format{Colors.ENDC}")
+            return {}
+        contacts_dict = {}
+        for contact in contacts_data:
+            try:
+                phone = contact.get('id', '').split('@')[0]
+                name = contact.get('name', '')
+                if not name:
+                    name = contact.get('pushname', '')
+                if phone and name:
+                    contacts_dict[phone] = name
+            except Exception as e:
+                print(f"{Colors.YELLOW}Warning: Could not process contact: {str(e)}{Colors.ENDC}")
+                continue
+        return contacts_dict
+    except requests.exceptions.Timeout:
+        print(f"{Colors.RED}Error: Connection to WhatsApp API timed out{Colors.ENDC}")
+        return {}
+    except requests.exceptions.ConnectionError:
+        print(f"{Colors.RED}Error: Could not connect to WhatsApp API. Please check your internet connection.{Colors.ENDC}")
+        return {}
+    except Exception as e:
+        print(f"{Colors.RED}Error fetching contacts: {str(e)}{Colors.ENDC}")
+        return {}
+CONTACTS = fetch_contacts()
+
+def get_name_from_chat_id(chat_id, message=None):
+    match = re.search(r'(\d+)@(c\.us|g\.us)', chat_id)
+    if not match:
+        return chat_id
+    phone_number = match.group(1)
+    is_group = match.group(2) == "g.us"
+    contact_name = None
+    if message and 'senderName' in message:
+        contact_name = message.get('senderName')
+    elif message and 'sender' in message and 'name' in message.get('sender', {}):
+        contact_name = message.get('sender', {}).get('name')
+    elif phone_number in CONTACTS:
+        contact_name = CONTACTS[phone_number]
+    if is_group:
+        group_name = None
+        if message and 'chatName' in message:
+            group_name = message.get('chatName')
+        if group_name:
+            return f"{Colors.CYAN}Group: {group_name}{Colors.ENDC}"
+        else:
+            return f"{Colors.CYAN}Group: {phone_number}{Colors.ENDC}"
+    else:
+        if contact_name:
+            return f"{Colors.GREEN}{contact_name} ({phone_number}){Colors.ENDC}"
+        else:
+            return f"{Colors.GREEN}{phone_number}{Colors.ENDC}"
+def find_matching_contacts(name_query):
+    if not name_query:
+        return {}
+    if name_query.isdigit():
+        if name_query in CONTACTS:
+            return {name_query: CONTACTS[name_query]}
+        else:
+            return {name_query: name_query}
+    name_query_lower = name_query.lower().strip()
+    exact_matches = {}
+    first_name_matches = {}
+    partial_matches = {}
+    for phone, name in CONTACTS.items():
+        name_lower = name.lower().strip()
+        if name_lower == name_query_lower:
+            exact_matches[phone] = name
+        elif name_lower.startswith(name_query_lower + ' '):
+            first_name_matches[phone] = name
+        elif name_query_lower in name_lower:
+            partial_matches[phone] = name
+    if exact_matches:
+        return exact_matches
+    if first_name_matches:
+        return first_name_matches
+    return partial_matches
+
+def select_contact(contact_query):
+
+    
+    if not contact_query:
+        print(f"{Colors.RED}Error: No contact provided.{Colors.ENDC}")
+        return None, None
+    try:
+        matching_contacts = find_matching_contacts(contact_query)
+        if not matching_contacts:
+            print(f"{Colors.RED}Error: No contacts found matching '{contact_query}'.{Colors.ENDC}")
+            return None, None
+        if len(matching_contacts) == 1:
+            phone = list(matching_contacts.keys())[0]
+            name = matching_contacts[phone]
+            chat_id = f"{phone}@c.us"
+            print(f"{Colors.CYAN}Using contact: {Colors.GREEN}{name} ({phone}){Colors.ENDC}")
+            return phone, chat_id
+        print(f"{Colors.YELLOW}Multiple contacts found matching '{contact_query}':{Colors.ENDC}")
+        contact_list = list(matching_contacts.items())
+        for i, (phone, name) in enumerate(contact_list, 1):
+            print(f"{Colors.CYAN}[{i}] {Colors.GREEN}{name} ({phone}){Colors.ENDC}")
+        attempts = 0
+        max_attempts = 3
+        while attempts < max_attempts:
+            try:
+                choice = input(f"\n{Colors.YELLOW}Please enter the number of the correct contact (or 'q' to quit): {Colors.ENDC}")
+                if choice.lower() == 'q':
+                    return None, None
+                choice_index = int(choice) - 1
+                if 0 <= choice_index < len(contact_list):
+                    selected_phone, selected_name = contact_list[choice_index]
+                    chat_id = f"{selected_phone}@c.us"
+                    print(f"{Colors.CYAN}Selected: {Colors.GREEN}{selected_name} ({selected_phone}){Colors.ENDC}")
+                    return selected_phone, chat_id
+                else:
+                    print(f"{Colors.RED}Invalid selection. Please enter a number between 1 and {len(contact_list)}.{Colors.ENDC}")
+                    attempts += 1
+            except ValueError:
+                print(f"{Colors.RED}Invalid input. Please enter a number or 'q' to quit.{Colors.ENDC}")
+                attempts += 1
+            except KeyboardInterrupt:
+                print(f"\n{Colors.YELLOW}Selection cancelled.{Colors.ENDC}")
+                return None, None
+        print(f"{Colors.RED}Too many invalid attempts. Selection cancelled.{Colors.ENDC}")
+        return None, None
+    except Exception as e:
+        print(f"{Colors.RED}Error during contact selection: {str(e)}{Colors.ENDC}")
+        return None, None
+
+def format_timestamp(timestamp):
+    dt = datetime.fromtimestamp(timestamp)
+    return dt.strftime("%Y-%m-%d %H:%M:%S")
+
+def get_message_text(message):
+    message_type = message.get("typeMessage", "")
+    if message_type == "textMessage":
+        return message.get("textMessage", "")
+    elif message_type == "extendedTextMessage":
+        extended = message.get("extendedTextMessage", {})
+        return extended.get("text", "")
+    elif message_type == "imageMessage":
+        caption = message.get("caption", "")
+        return f"[Image] {caption}"
+    elif message_type == "stickerMessage":
+        return "[Sticker]"
+    elif message_type == "quotedMessage":
+        extended = message.get("extendedTextMessage", {})
+        return f"[Quote] {extended.get('text', '')}"
+    else:
+        return f"[{message_type}]"
+
+def get_message_direction(message):
+    if '_is_outgoing' in message:
+        if message['_is_outgoing']:
+            return f"{Colors.BOLD}{Colors.BLUE}▶ SENT{Colors.ENDC}"
+        else:
+            return f"{Colors.BOLD}{Colors.YELLOW}◀ RECEIVED{Colors.ENDC}"
+    if message.get("fromMe", False) or message.get("outgoing", False):
+        return f"{Colors.BOLD}{Colors.BLUE}▶ SENT{Colors.ENDC}"
+    else:
+        return f"{Colors.BOLD}{Colors.YELLOW}◀ RECEIVED{Colors.ENDC}"
+
+def fetch_messages(mode='chat', minutes=20, contact_filter=None, include_groups=False):
+    all_messages = []
+    if mode == 'outgoing' or mode == 'chat':
+        outgoing_url = f"{BASE_URL}/lastOutgoingMessages/{API_TOKEN}"
+        payload = {"minutes": minutes}
+        headers = {}
+        try:
+            outgoing_response = requests.request("GET", outgoing_url, headers=headers, data=payload, timeout=15)
+            if outgoing_response.status_code == 200:
+                try:
+                    outgoing_data = json.loads(outgoing_response.text)
+                    for message in outgoing_data:
+                        message['_is_outgoing'] = True
+                    all_messages.extend(outgoing_data)
+                except json.JSONDecodeError:
+                    print(f"{Colors.RED}Error: Could not parse outgoing messages API response as JSON{Colors.ENDC}")
+            else:
+                print(f"{Colors.RED}Error fetching outgoing messages: API returned status code {outgoing_response.status_code}{Colors.ENDC}")
+        except requests.exceptions.Timeout:
+            print(f"{Colors.RED}Error: Connection to WhatsApp API timed out while fetching outgoing messages{Colors.ENDC}")
+        except requests.exceptions.ConnectionError:
+            print(f"{Colors.RED}Error: Could not connect to WhatsApp API while fetching outgoing messages. Please check your internet connection.{Colors.ENDC}")
+        except Exception as e:
+            print(f"{Colors.RED}Error fetching outgoing messages: {str(e)}{Colors.ENDC}")
+    if mode == 'receiving' or mode == 'chat':
+        incoming_url = f"{BASE_URL}/lastIncomingMessages/{API_TOKEN}"
+        payload = {"minutes": minutes}
+        headers = {}
+        try:
+            incoming_response = requests.request("GET", incoming_url, headers=headers, data=payload, timeout=15)
+            if incoming_response.status_code == 200:
+                try:
+                    incoming_data = json.loads(incoming_response.text)
+                    for message in incoming_data:
+                        message['_is_outgoing'] = False
+                    all_messages.extend(incoming_data)
+                except json.JSONDecodeError:
+                    print(f"{Colors.RED}Error: Could not parse incoming messages API response as JSON{Colors.ENDC}")
+            else:
+                print(f"{Colors.RED}Error fetching incoming messages: API returned status code {incoming_response.status_code}{Colors.ENDC}")
+        except requests.exceptions.Timeout:
+            print(f"{Colors.RED}Error: Connection to WhatsApp API timed out while fetching incoming messages{Colors.ENDC}")
+        except requests.exceptions.ConnectionError:
+            print(f"{Colors.RED}Error: Could not connect to WhatsApp API while fetching incoming messages. Please check your internet connection.{Colors.ENDC}")
+        except KeyboardInterrupt:
+            print(f"\n{Colors.YELLOW}Message fetching cancelled.{Colors.ENDC}")
+            return []
+        except Exception as e:
+            print(f"{Colors.RED}Error fetching incoming messages: {str(e)}{Colors.ENDC}")
+    filtered_messages = []
+    contact_phones = []
+    if contact_filter:
+        matching_contacts = find_matching_contacts(contact_filter)
+        if matching_contacts:
+            contact_phones = list(matching_contacts.keys())
+        elif contact_filter.isdigit():
+            contact_phones = [contact_filter]
+    for message in all_messages:
+        chat_id = message.get("chatId", "")
+        if contact_filter:
+            phone_match = re.search(r'(\d+)@', chat_id)
+            extracted_phone = phone_match.group(1) if phone_match else ""
+            if contact_phones:
+                matched = False
+                for phone in contact_phones:
+                    if phone == extracted_phone or phone in chat_id:
+                        matched = True
+                        break
+                if not matched:
+                    continue
+            else:
+                sender_name = ""
+                if 'senderName' in message:
+                    sender_name = message.get('senderName', '')
+                elif 'sender' in message and 'name' in message.get('sender', {}):
+                    sender_name = message.get('sender', {}).get('name', '')
+                contact_filter_lower = contact_filter.lower().strip()
+                if extracted_phone and extracted_phone in CONTACTS:
+                    contact_name = CONTACTS[extracted_phone].lower().strip()
+                    if contact_name == contact_filter_lower or contact_filter_lower in contact_name:
+                        pass
+                    else:
+                        continue
+                elif sender_name:
+                    sender_name_lower = sender_name.lower().strip()
+                    if sender_name_lower == contact_filter_lower or contact_filter_lower in sender_name_lower:
+                        pass
+                    else:
+                        continue
+                else:
+                    continue
+        if not include_groups and "@g.us" in chat_id:
+            continue
+        filtered_messages.append(message)
+    try:
+        filtered_messages.sort(key=lambda x: x.get('timestamp', 0))
+    except Exception as e:
+        print(f"{Colors.YELLOW}Warning: Could not sort messages by timestamp: {str(e)}{Colors.ENDC}")
+    return filtered_messages
+
+def monitor_messages(contact_filter=None, include_groups=False):
+    try:
+        contact_phones = []
+        if contact_filter:
+            matching_contacts = find_matching_contacts(contact_filter)
+            if matching_contacts:
+                contact_phones = list(matching_contacts.keys())
+            elif contact_filter.isdigit():
+                contact_phones = [contact_filter]
+            else:
+                contact_phones = [contact_filter]
+        print(f"{Colors.CYAN}Monitoring for new WhatsApp messages... Press Ctrl+C to stop.{Colors.ENDC}\n")
+        consecutive_errors = 0
+        max_consecutive_errors = 5
+        while not is_exiting:
+            try:
+                receive_url = f"{BASE_URL}/receiveNotification/{API_TOKEN}"
+                response = requests.request("GET", receive_url, headers={}, data={}, timeout=30)
+                if response.status_code == 200:
+                    try:
+                        notification = json.loads(response.text)
+                        consecutive_errors = 0
+                        if notification and 'receiptId' in notification:
+                            receipt_id = notification.get('receiptId')
+                            if 'body' in notification and notification['body'].get('typeWebhook') in ['incomingMessageReceived', 'outgoingMessageReceived']:
+                                try:
+                                    message_data = notification['body']
+                                    chat_id = message_data.get('senderData', {}).get('chatId', 'Unknown')
+                                    if contact_filter:
+                                        if contact_filter.isdigit():
+                                            if contact_filter not in chat_id:
+                                                delete_notification(receipt_id)
+                                                continue
+                                        elif contact_phones:
+                                            matched = False
+                                            for phone in contact_phones:
+                                                if phone in chat_id:
+                                                    matched = True
+                                                    break
+                                            if not matched:
+                                                delete_notification(receipt_id)
+                                                continue
+                                        else:
+                                            sender_name = message_data.get('senderData', {}).get('senderName', '')
+                                            contact_filter_lower = contact_filter.lower().strip()
+                                            sender_name_lower = sender_name.lower().strip()
+                                            if contact_filter_lower != sender_name_lower and contact_filter_lower not in sender_name_lower:
+                                                delete_notification(receipt_id)
+                                                continue
+                                    if not include_groups and "@g.us" in chat_id:
+                                        delete_notification(receipt_id)
+                                        continue
+                                    timestamp = message_data.get('timestamp', int(time.time()))
+                                    sender_name = message_data.get('senderData', {}).get('senderName', chat_id)
+                                    message_type = message_data.get('messageData', {}).get('typeMessage', '')
+                                    message_text = ""
+                                    if message_type == 'textMessage':
+                                        message_text = message_data.get('messageData', {}).get('textMessageData', {}).get('textMessage', '[No text]')
+                                    elif message_type == 'extendedTextMessage':
+                                        message_text = message_data.get('messageData', {}).get('extendedTextMessageData', {}).get('text', '[No text]')
+                                    else:
+                                        message_text = f"[{message_type}]"
+                                    time_str = format_timestamp(timestamp)
+                                    is_outgoing = False
+                                    if notification['body'].get('typeWebhook') == 'outgoingMessageReceived':
+                                        is_outgoing = True
+                                    elif message_data.get('senderData', {}).get('sender', '') == 'outgoing':
+                                        is_outgoing = True
+                                    elif message_data.get('outgoing', False):
+                                        is_outgoing = True
+                                    direction = f"{Colors.BOLD}{Colors.BLUE}▶ SENT{Colors.ENDC}" if is_outgoing else f"{Colors.BOLD}{Colors.YELLOW}◀ RECEIVED{Colors.ENDC}"
+                                    sender = f"{Colors.GREEN}{sender_name} ({chat_id}){Colors.ENDC}"
+                                    print(f"{Colors.YELLOW}[{time_str}]{Colors.ENDC} {direction} {sender}: {Colors.BOLD}{message_text}{Colors.ENDC}")
+                                    print(f"{Colors.BLUE}{'─' * 50}{Colors.ENDC}")
+                                except Exception as e:
+                                    print(f"{Colors.RED}Error processing message: {str(e)}{Colors.ENDC}")
+                            delete_notification(receipt_id)
+                    except json.JSONDecodeError:
+                        print(f"{Colors.RED}Error: Could not parse API response as JSON{Colors.ENDC}")
+                        consecutive_errors += 1
+                else:
+                    print(f"{Colors.RED}Error: API returned status code {response.status_code}{Colors.ENDC}")
+                    consecutive_errors += 1
+                if consecutive_errors >= max_consecutive_errors:
+                    print(f"{Colors.RED}Too many consecutive errors. Exiting monitoring mode.{Colors.ENDC}")
+                    break
+                time.sleep(1)
+            except requests.exceptions.Timeout:
+                print(f"{Colors.YELLOW}Warning: API request timed out. Retrying...{Colors.ENDC}")
+                consecutive_errors += 1
+                time.sleep(5)
+            except requests.exceptions.ConnectionError:
+                print(f"{Colors.YELLOW}Warning: Connection error. Retrying in 10 seconds...{Colors.ENDC}")
+                consecutive_errors += 1
+                time.sleep(10)
+            except Exception as e:
+                print(f"{Colors.RED}Error in monitoring loop: {str(e)}{Colors.ENDC}")
+                consecutive_errors += 1
+                time.sleep(2)
+    except KeyboardInterrupt:
+        print(f"\n{Colors.YELLOW}Monitoring stopped.{Colors.ENDC}")
+    except Exception as e:
+        print(f"{Colors.RED}Error in monitoring: {str(e)}{Colors.ENDC}")
+
+def send_message(contact, message_text):
+    if not contact or not message_text:
+        print(f"{Colors.RED}Error: Both contact and message are required to send a message.{Colors.ENDC}")
+        return False
+    selected_phone, chat_id = select_contact(contact)
+    if not chat_id:
+        print(f"{Colors.RED}Error: Could not find or select contact '{contact}' in your contacts.{Colors.ENDC}")
+        return False
+    url = f"{BASE_URL}/sendMessage/{API_TOKEN}"
+    payload = {
+        "chatId": chat_id,
+        "message": message_text
+    }
+    headers = {
+        'Content-Type': 'application/json'
+    }
+    try:
+        print(f"{Colors.CYAN}Sending message to {chat_id}...{Colors.ENDC}")
+        response = requests.post(url, json=payload, headers=headers, timeout=15)
+        if response.status_code == 200:
+            try:
+                response_data = json.loads(response.text)
+                if response_data.get('idMessage'):
+                    print(f"{Colors.GREEN}Message sent successfully! ID: {response_data.get('idMessage')}{Colors.ENDC}")
+                    return True
+                else:
+                    print(f"{Colors.RED}Error sending message: {response.text}{Colors.ENDC}")
+                    return False
+            except json.JSONDecodeError:
+                print(f"{Colors.RED}Error: Could not parse API response as JSON{Colors.ENDC}")
+                return False
+        else:
+            print(f"{Colors.RED}Error: {response.status_code} - {response.text}{Colors.ENDC}")
+            return False
+    except requests.exceptions.Timeout:
+        print(f"{Colors.RED}Error: Connection to WhatsApp API timed out while sending message{Colors.ENDC}")
+        return False
+    except requests.exceptions.ConnectionError:
+        print(f"{Colors.RED}Error: Could not connect to WhatsApp API. Please check your internet connection.{Colors.ENDC}")
+        return False
+    except KeyboardInterrupt:
+        print(f"\n{Colors.YELLOW}Message sending cancelled.{Colors.ENDC}")
+        return False
+    except Exception as e:
+        print(f"{Colors.RED}Error sending message: {str(e)}{Colors.ENDC}")
+        return False
+
+def delete_notification(receipt_id):
+    try:
+        delete_url = f"{BASE_URL}/deleteNotification/{API_TOKEN}/{receipt_id}"
+        response = requests.request("DELETE", delete_url, headers={}, data={}, timeout=10)
+        if response.status_code != 200:
+            print(f"{Colors.YELLOW}Warning: Failed to delete notification: Status code {response.status_code}{Colors.ENDC}")
+    except requests.exceptions.Timeout:
+        print(f"{Colors.YELLOW}Warning: Timeout while deleting notification{Colors.ENDC}")
+    except requests.exceptions.ConnectionError:
+        print(f"{Colors.YELLOW}Warning: Connection error while deleting notification{Colors.ENDC}")
+    except Exception as e:
+        print(f"{Colors.YELLOW}Warning: Error deleting notification: {str(e)}{Colors.ENDC}")
+
+def display_messages(messages):
+    print(f"\n{Colors.HEADER}{Colors.BOLD}=== WhatsApp Messages ==={Colors.ENDC}")
+    print(f"{Colors.CYAN}Showing {len(messages)} messages{Colors.ENDC}\n")
+    for message in messages:
+        chat_id = message.get("chatId", "Unknown")
+        timestamp = message.get("timestamp", 0)
+        message_text = get_message_text(message)
+        message_direction = get_message_direction(message)
+        time_str = format_timestamp(timestamp)
+        sender = get_name_from_chat_id(chat_id, message)
+        print(f"{Colors.YELLOW}[{time_str}]{Colors.ENDC} {message_direction} {sender}: {Colors.BOLD}{message_text}{Colors.ENDC}")
+        print(f"{Colors.BLUE}{'─' * 50}{Colors.ENDC}")
+    if messages:
+        print(f"\n{Colors.CYAN}End of messages. Latest message shown at the bottom.{Colors.ENDC}")
+
+def Usage():
+    print(f"{Colors.RED}No messages found for the specified criteria.{Colors.ENDC}")
+    print(f"{Colors.YELLOW}Usage examples:{Colors.ENDC}")
+    print(f"  python3 whatschat -c -t 60                     # Get all messages from the last 60 minutes")
+    print(f"  python3 whatschat -o -i 972533020957           # Get only outgoing messages to a specific contact")
+    print(f"  python3 whatschat -r -g                        # Get all received messages including from groups")
+    print(f"  python3 whatschat -m -i Yaniv                  # Monitor in real-time for messages from contacts containing 'Yaniv'")
+    print(f"  python3 whatschat -s -i Liz --text 'Hello!'    # Send a message to a contact named Liz")
+
+def main():
+    args = parse_arguments()
+    specific_contact = None
+    if args.identifier and not args.identifier.isdigit():
+        if not args.send and not args.ai:
+            matching_contacts = find_matching_contacts(args.identifier)
+            if not matching_contacts:
+                print(f"{Colors.RED}No contacts found matching '{args.identifier}'.{Colors.ENDC}")
+            elif len(matching_contacts) > 1:
+                print(f"{Colors.YELLOW}Multiple contacts found matching '{args.identifier}':{Colors.ENDC}")
+                for i, (phone, name) in enumerate(matching_contacts.items(), 1):
+                    print(f"{Colors.CYAN}[{i}] {Colors.GREEN}{name} ({phone}){Colors.ENDC}")
+                print(f"{Colors.CYAN}[a] Show messages from all matching contacts{Colors.ENDC}")
+                while True:
+                    choice = input(f"\n{Colors.YELLOW}Please select a contact number or 'a' for all: {Colors.ENDC}")
+                    if choice.lower() == 'a':
+                        break
+                    try:
+                        choice_index = int(choice) - 1
+                        contact_list = list(matching_contacts.items())
+                        if 0 <= choice_index < len(contact_list):
+                            specific_contact = contact_list[choice_index][0]
+                            name = contact_list[choice_index][1]
+                            print(f"{Colors.CYAN}Selected: {Colors.GREEN}{name} ({specific_contact}){Colors.ENDC}")
+                            break
+                        else:
+                            print(f"{Colors.RED}Invalid selection. Please enter a number between 1 and {len(matching_contacts)}, or 'a'.{Colors.ENDC}")
+                    except ValueError:
+                        print(f"{Colors.RED}Invalid input. Please enter a number or 'a'.{Colors.ENDC}")
+            elif len(matching_contacts) == 1:
+                phone = list(matching_contacts.keys())[0]
+                name = matching_contacts[phone]
+                print(f"{Colors.CYAN}Using contact: {Colors.GREEN}{name} ({phone}){Colors.ENDC}")
+    if args.monitor:
+        monitor_messages(contact_filter=specific_contact or args.identifier, include_groups=args.groups)
+    elif args.send:
+        if not args.identifier:
+            print(f"{Colors.RED}Error: You must specify a contact to send a message to with -i/--identifier.{Colors.ENDC}")
+            print(f"{Colors.YELLOW}Example: python3 whatschat -s -i 972547165998 --message 'Hello there'{Colors.ENDC}")
+            sys.exit(1)
+        if not args.text:
+            print(f"{Colors.RED}Error: You must specify a message to send with --text.{Colors.ENDC}")
+            print(f"{Colors.YELLOW}Example: python3 whatschat -s -i 972547165998 --text 'Hello there'{Colors.ENDC}")
+            sys.exit(1)
+        send_message(args.identifier, args.text)
+    elif args.ai:
+        if not args.text:
+            print(f"{Colors.RED}Error: You must specify a message to send to GPT with --text.{Colors.ENDC}")
+            sys.exit(1)
+        if not args.identifier:
+            print(f"{Colors.RED}Error: You must specify a contact to send the GPT response to with -i/--identifier.{Colors.ENDC}")
+            print(f"{Colors.YELLOW}Example: python3 whatschat -a -i Yaniv --text 'What is the weather today?'{Colors.ENDC}")
+            sys.exit(1)
+        print(f"{Colors.CYAN}Step 1: Sending message to GPT...{Colors.ENDC}")
+        response = call_gpt(args.text)
+        if not response:
+            print(f"{Colors.RED}Error: No response received from GPT.{Colors.ENDC}")
+            sys.exit(1)
+        print(f"\n{Colors.GREEN}GPT Response:{Colors.ENDC}")
+        print(response)
+        print(f"\n{Colors.CYAN}Step 2: Sending GPT response to WhatsApp contact...{Colors.ENDC}")
+        send_success = send_message(args.identifier, response)
+        if send_success:
+            print(f"{Colors.GREEN}GPT response successfully sent to WhatsApp contact!{Colors.ENDC}")
+        else:
+            print(f"{Colors.RED}Failed to send GPT response to WhatsApp contact.{Colors.ENDC}")
+            sys.exit(1)
+    else:
+        mode = 'chat'
+        if args.outgoing:
+            mode = 'outgoing'
+        elif args.receiving:
+            mode = 'receiving'
+        if args.identifier:
+            matching_contacts = find_matching_contacts(args.identifier)
+        messages = fetch_messages(
+            mode=mode,
+            minutes=args.time,
+            contact_filter=specific_contact or args.identifier,
+            include_groups=args.groups
+        )
+        if not messages:
+            Usage()
+            if args.identifier and find_matching_contacts(args.identifier):
+                print(f"\n{Colors.YELLOW}Note: Valid contacts were found for '{args.identifier}', but no messages matched your criteria.{Colors.ENDC}")
+                print(f"{Colors.YELLOW}Try increasing the time period with -t parameter or check if you have messages with this contact.{Colors.ENDC}")
+            else:
+                sys.exit(1)
+        else:
+            display_messages(messages)
+if __name__ == "__main__":
+    main()
